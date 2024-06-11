@@ -387,7 +387,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 		Index:   rf.getNextIndex(),
 	})
-	rf.rflog("start aaaaaa : %d", rf.getLastIndex())
+	// rf.rflog("start aaaaaa : %d", rf.getLastIndex())
 	return rf.getLastIndex(), rf.currentTerm, true
 	// return index, term, isLeader
 }
@@ -538,15 +538,19 @@ func (rf *Raft) startElection() {
 							rf.becomeLeader()
 							rf.runHeartBeats()
 						}
+					} else if reply.Term > rf.currentTerm {
+						rf.rflog("receive bigger term in reply, maybe out of data")
+						rf.becomeFollower(reply.Term)
+						rf.electionStartTime = time.Now()
 					}
-				} else if reply.Term > rf.currentTerm {
-					rf.rflog("receive bigger term in reply, maybe out of data")
-					rf.becomeFollower(reply.Term)
-					rf.electionStartTime = time.Now()
 				}
+
 			}
 		}(server)
 	}
+
+	// 参考代码：因为锁的抢占问题可能 ticker() 中获取状态时已经变成 leader 了，进而存在两个心跳计时器，因此指定开启哪个定时器
+	go rf.ticker(Follower)
 }
 
 // Lab3B 完善 AppendEntriesArgs 发送信息
@@ -575,9 +579,9 @@ func (rf *Raft) runHeartBeats() {
 				}
 				prevLogIndex := rf.nextIndex[server] - 1
 				nowLogIndex := rf.nextIndex[server]
-				rf.rflog("rqrqrqrt %d", prevLogIndex)
+				// rf.rflog("rqrqrqrt %d", prevLogIndex)
 				entries := make([]LogEntry, rf.getNextIndex()-nowLogIndex)
-				rf.rflog("??logentry :xxxx %d, :  %d", rf.getNextIndex(), nowLogIndex)
+				// rf.rflog("??logentry :xxxx %d, :  %d", rf.getNextIndex(), nowLogIndex)
 				copy(entries, rf.log[nowLogIndex-rf.getFirstIndex():])
 				args := AppendEntriesArgs{
 					Term:         currentTerm,
@@ -591,7 +595,7 @@ func (rf *Raft) runHeartBeats() {
 				rf.mu.Unlock()
 				var reply AppendEntriesReply
 				rf.rflog("sending AppendEntries to [%v], args = [%+v]", server, args)
-				if success := rf.sendHeartBeats(server, &args, &reply); success {
+				if rf.sendHeartBeats(server, &args, &reply) {
 					rf.rflog("Leader - - - - receive AppendEntries reply [%+v]", reply)
 					rf.mu.Lock()
 
@@ -619,7 +623,7 @@ func (rf *Raft) handleAppendEntriesRPCResponse(server int, args *AppendEntriesAr
 				// 统计投票结果, 更新 commitIndex\
 				// rf.rflog("??????????????? %d", rf.commitIndex)
 				savedCommitIndex := rf.commitIndex
-				rf.rflog("now ::aaaaaaaaaaaaaaaaa %d, idxxxxxxx : %d", rf.commitIndex+1, rf.getNextIndex())
+				// rf.rflog("now ::aaaaaaaaaaaaaaaaa %d, idxxxxxxx : %d", rf.commitIndex+1, rf.getNextIndex())
 				for i := rf.commitIndex + 1; i < rf.getNextIndex(); i++ {
 					if rf.getTerm(i) == rf.currentTerm {
 						count := 1
@@ -628,7 +632,7 @@ func (rf *Raft) handleAppendEntriesRPCResponse(server int, args *AppendEntriesAr
 								count++
 							}
 						}
-						rf.rflog("now ppppp ::tttttttttttt %d, idxxxxxxx : %d", count, i)
+						// rf.rflog("now ppppp ::tttttttttttt %d, idxxxxxxx : %d", count, i)
 						if count*2 >= len(rf.peers)+1 {
 							// rf.rflog("ttttttttttt !!!!!!!!!!!!!! %d,  now  idx", cout, i)
 							rf.commitIndex = i
@@ -713,7 +717,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				argsLogIndex++
 			}
 
-			rf.rflog("?????????:  append logs %d,  :,   %d", argsLogIndex, len(args.Entries))
+			// rf.rflog("?????????:  append logs %d,  :,   %d", argsLogIndex, len(args.Entries))
 			// rf.rflog("?????????: oooooo  %d,  :,   %d", insertIndex, argsLogIndex)
 
 			// 从第一个不匹配的索引开始，将args的entries采用覆盖/追加的方式加入到server的日志中
@@ -724,7 +728,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 
 			// 检查是否需要提交命令
-			rf.rflog("xxxxxxxxxxxxxxxxxx :%d  --- %d", args.LeaderCommit, rf.commitIndex)
+			// rf.rflog("xxxxxxxxxxxxxxxxxx :%d  --- %d", args.LeaderCommit, rf.commitIndex)
 			if args.LeaderCommit > rf.commitIndex {
 				rf.commitIndex = min(rf.getNextIndex()-1, args.LeaderCommit)
 				rf.rflog("updates commitIndex into %v", rf.commitIndex)
