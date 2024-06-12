@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -82,10 +84,13 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	//持久化变量
 	currentTerm int
 	voteFor     int
-	state       RuleState
 	log         []LogEntry
+
+	state RuleState
+
 	commitIndex int
 	lastApplied int
 	nextIndex   []int
@@ -143,6 +148,18 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
+
+// encode
+func (rf *Raft) encodeState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	return raftstate
+}
+
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
@@ -151,7 +168,7 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.xxx)
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	rf.persister.Save(rf.encodeState(), nil)
 }
 
 // restore previously persisted state.
@@ -161,10 +178,21 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (3C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var vorteFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&vorteFor) != nil || d.Decode(&log) != nil {
+		//任何一个解码操作失败 直接return
+		return
+	} else {
+		rf.mu.Lock()
+		rf.currentTerm = currentTerm
+		rf.voteFor = vorteFor
+		rf.log = log
+		rf.mu.Unlock()
+	}
 	// if d.Decode(&xxx) != nil ||
 	//    d.Decode(&yyy) != nil {
 	//   error...
@@ -206,6 +234,7 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.state = Follower
 	rf.currentTerm = term
 	rf.voteFor = -1
+	rf.persist()
 	rf.rflog("becomes follower at term [%d]", term)
 	go rf.ticker(Follower)
 }
@@ -387,6 +416,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 		Index:   rf.getNextIndex(),
 	})
+	rf.persist()
 	// rf.rflog("start aaaaaa : %d", rf.getLastIndex())
 	return rf.getLastIndex(), rf.currentTerm, true
 	// return index, term, isLeader
@@ -453,12 +483,12 @@ func (rf *Raft) ticker(state RuleState) {
 	}
 }
 
-// 超时选举 [50, 300]
+// 超时选举 [150, 300]
 // 利用定时器不断检查，变为Leader后直接结束
 // 注意，我们一定要保持任期是一致的，若落后了表明当前协程是上个任期运行的定时器，直接结束
 // 一直满足条件的话，就等待超时后变为候选者进行选举
 func (rf *Raft) runElectionTimer() {
-	ms := 250 + (rand.Int63() % 150)
+	ms := 150 + (rand.Int63() % 150)
 	timeout := time.Duration(ms) * time.Millisecond
 	rf.mu.Lock()
 	nowTerm := rf.currentTerm
@@ -504,7 +534,7 @@ func (rf *Raft) startElection() {
 	rf.state = Candidate
 	rf.voteFor = rf.me
 	rf.electionStartTime = time.Now()
-
+	rf.persist()
 	// rf.rflog("becomes Candidate, start election! now term is %d", rf.currentTerm)
 
 	receivedVotes := 1
@@ -677,7 +707,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.rflog("receives AppendEntries [Term:%d LeaderId:%d PrevLogIndex:%d PrevLogTerm:%d Entries:%d LeaderCommit:%d]",
 		args.Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderCommit)
 
-	// need_persist := false
+	need_persist := false
 
 	if args.Term > rf.currentTerm {
 		rf.rflog("now have leader %d , transforms to follower %d", args.LeaderId, rf.me)
@@ -723,7 +753,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// 从第一个不匹配的索引开始，将args的entries采用覆盖/追加的方式加入到server的日志中
 			if argsLogIndex < len(args.Entries) {
 				rf.log = append(rf.log[:insertIndex-rf.getFirstIndex()], args.Entries[argsLogIndex:]...)
-				// need_persist = true
+				need_persist = true
 				rf.rflog("append logs [%v] in AppendEntries", args.Entries[argsLogIndex:])
 			}
 
@@ -735,6 +765,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.commitCond.Signal()
 			}
 		}
+	}
+
+	if need_persist {
+		rf.persist()
 	}
 
 	reply.Term = rf.currentTerm
