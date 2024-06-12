@@ -458,7 +458,7 @@ func (rf *Raft) ticker(state RuleState) {
 // 注意，我们一定要保持任期是一致的，若落后了表明当前协程是上个任期运行的定时器，直接结束
 // 一直满足条件的话，就等待超时后变为候选者进行选举
 func (rf *Raft) runElectionTimer() {
-	ms := 50 + (rand.Int63() % 300)
+	ms := 250 + (rand.Int63() % 150)
 	timeout := time.Duration(ms) * time.Millisecond
 	rf.mu.Lock()
 	nowTerm := rf.currentTerm
@@ -649,7 +649,7 @@ func (rf *Raft) handleAppendEntriesRPCResponse(server int, args *AppendEntriesAr
 			} else if rf.nextIndex[server] > 1 {
 
 				rf.nextIndex[server] -= 1
-				rf.rflog("receives reply from [%v] failed", server)
+				rf.rflog("tttttttttttt receives reply from [%v] failed", server)
 				return true
 			}
 		} else if reply.Term > rf.currentTerm {
