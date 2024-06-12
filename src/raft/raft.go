@@ -168,7 +168,7 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.xxx)
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
-	rf.persister.Save(rf.encodeState(), nil)
+	rf.persister.Save(rf.encodeState(), rf.persister.ReadSnapshot())
 }
 
 // restore previously persisted state.
@@ -208,7 +208,102 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	rf.rflog("snapshot index %d", index)
+	lastIndex := rf.getFirstIndex()
+	if lastIndex >= index {
+		//已经做过快照了
+		return
+	}
+
+	var tmp []LogEntry
+	//将没创建过快照的日志乡村放到tmp中，然后赋值给rf.log(覆盖)
+	rf.log = append(tmp, rf.log[index-lastIndex:]...)
+	//第0个日志存快照信息
+	//lastIncludedIndex 和 lastIncludeTerm 就是下标为 index 的日志的信息
+	//, 因此裁剪时保留它充当快照信息
+	rf.log[0].Command = nil
+	rf.persister.Save(rf.encodeState(), snapshot)
+}
+
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int //快照中最后一个条目的索引
+	LastIncludedTerm  int //快照中最后一个条目的任期
+	Snapshot          []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	if rf.state == Dead {
+		rf.mu.Unlock()
+		return
+	}
+
+	rf.rflog("receives InstallSnapshot [%v]", args)
+	if args.Term > rf.currentTerm {
+		rf.rflog("term is out of data in InstallSnapshot")
+		rf.becomeFollower(args.Term)
+		rf.electionStartTime = time.Now()
+	}
+
+	reply.Term = rf.currentTerm
+	if args.Term == rf.currentTerm {
+		if rf.state != Follower {
+			rf.state = Follower
+		}
+		rf.electionStartTime = time.Now()
+
+		//因为延迟得到过期的快照
+		if rf.commitIndex >= args.LastIncludedIndex {
+			rf.rflog("receive out of data snapshot, commitIndex: [%d], args.LsdtIncludedIndex: [%d]", rf.commitIndex, args.LastIncludedIndex)
+			rf.mu.Unlock()
+			return
+		}
+
+		//裁剪日志，将已经保存到快照的日志删除
+		if rf.getLastIndex() <= args.LastIncludedIndex {
+			//将以保存到快照中的日志删除
+			rf.log = make([]LogEntry, 1)
+		} else {
+			var tmp []LogEntry
+			rf.log = append(tmp, rf.log[args.LastIncludedIndex-rf.getFirstIndex():]...)
+		}
+
+		rf.log[0].Term = args.LastIncludedTerm
+		rf.log[0].Index = args.LastIncludedIndex
+		rf.log[0].Command = nil
+		//rf的log修改后，将persist变量持久化存储，并保存快照
+		//server将leader中的快照保存到自己的存储中
+		rf.persister.Save(rf.encodeState(), args.Snapshot)
+
+		rf.rflog("persist on InstallSnapshot over!, term is %d, log is %d", rf.currentTerm, rf.log)
+		rf.lastApplied = args.LastIncludedIndex
+		rf.commitIndex = args.LastIncludedIndex
+		rf.mu.Unlock()
+		rf.applyChan <- ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      args.Snapshot,
+			SnapshotTerm:  args.LastIncludedTerm,
+			SnapshotIndex: args.LastIncludedIndex,
+		}
+		rf.rflog("InstallSnapshot over!")
+		return
+	}
+
+	rf.mu.Unlock()
 }
 
 // example RequestVote RPC arguments structure.
@@ -610,38 +705,78 @@ func (rf *Raft) runHeartBeats() {
 					rf.mu.Unlock()
 					return
 				}
-				prevLogIndex := rf.nextIndex[server] - 1
-				nowLogIndex := rf.nextIndex[server]
-				// rf.rflog("rqrqrqrt %d", prevLogIndex)
-				entries := make([]LogEntry, rf.getNextIndex()-nowLogIndex)
-				// rf.rflog("??logentry :xxxx %d, :  %d", rf.getNextIndex(), nowLogIndex)
-				copy(entries, rf.log[nowLogIndex-rf.getFirstIndex():])
-				args := AppendEntriesArgs{
-					Term:         currentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: prevLogIndex,
-					PrevLogTerm:  rf.getTerm(prevLogIndex),
-					Entries:      entries,
-					LeaderCommit: rf.commitIndex,
-				}
 
-				rf.mu.Unlock()
-				var reply AppendEntriesReply
-				rf.rflog("sending AppendEntries to [%v], args = [%+v]", server, args)
-				if rf.sendHeartBeats(server, &args, &reply) {
-					rf.rflog("Leader - - - - receive AppendEntries reply [%+v]", reply)
-					rf.mu.Lock()
-
-					if rf.handleAppendEntriesRPCResponse(server, &args, &reply) {
-						rf.mu.Unlock()
-						continue
+				firstIndex := rf.getFirstIndex()
+				//想要发送的日志已经被删除了，需要快照来恢复
+				if rf.nextIndex[server] <= firstIndex {
+					rf.rflog("send snapshot to %d, nextIndex is [%d] but lastIncludedIndex is [%d]", server, rf.nextIndex[server], firstIndex)
+					args := InstallSnapshotArgs{
+						Term:              currentTerm,
+						LeaderId:          rf.me,
+						LastIncludedTerm:  rf.getFirstTerm(),
+						LastIncludedIndex: firstIndex,
+						Snapshot:          rf.persister.ReadSnapshot(),
 					}
 					rf.mu.Unlock()
+					var reply InstallSnapshotReply
+					rf.rflog("sending InstallSnapshotArgs to [%v], args = [%+v]", server, args)
+					if rf.sendInstallSnapshot(server, &args, &reply) {
+						rf.rflog("receive InstallSnapshot reply [%+v]", reply)
+						rf.mu.Lock()
+						//更新matchIndex和nextIndex
+						rf.handleInstallSnapshotRPCResponse(server, &args, &reply)
+						rf.mu.Unlock()
+					}
+					return
+				} else {
+					prevLogIndex := rf.nextIndex[server] - 1
+					nowLogIndex := rf.nextIndex[server]
+					// rf.rflog("rqrqrqrt %d", prevLogIndex)
+					entries := make([]LogEntry, rf.getNextIndex()-nowLogIndex)
+					// rf.rflog("??logentry :xxxx %d, :  %d", rf.getNextIndex(), nowLogIndex)
+					copy(entries, rf.log[nowLogIndex-rf.getFirstIndex():])
+					args := AppendEntriesArgs{
+						Term:         currentTerm,
+						LeaderId:     rf.me,
+						PrevLogIndex: prevLogIndex,
+						PrevLogTerm:  rf.getTerm(prevLogIndex),
+						Entries:      entries,
+						LeaderCommit: rf.commitIndex,
+					}
+
+					rf.mu.Unlock()
+					var reply AppendEntriesReply
+					rf.rflog("sending AppendEntries to [%v], args = [%+v]", server, args)
+					if rf.sendHeartBeats(server, &args, &reply) {
+						rf.rflog("Leader - - - - receive AppendEntries reply [%+v]", reply)
+						rf.mu.Lock()
+
+						if rf.handleAppendEntriesRPCResponse(server, &args, &reply) {
+							rf.mu.Unlock()
+							continue
+						}
+						rf.mu.Unlock()
+					}
+					return
 				}
-				return
 
 			}
 		}(server)
+	}
+}
+
+func (rf *Raft) handleInstallSnapshotRPCResponse(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	if rf.state == Leader && rf.currentTerm == args.Term {
+		if reply.Term == rf.currentTerm {
+			rf.rflog("receives reply from [%v], nextIndex changes from [%v] to [%v]",
+				server, rf.nextIndex[server], args.LastIncludedIndex+1)
+			rf.matchIndex[server] = max(rf.matchIndex[server], args.LastIncludedIndex)
+			rf.nextIndex[server] = rf.matchIndex[server] + 1
+		} else if reply.Term > rf.currentTerm {
+			rf.rflog("receive bigger term in reply, transforms to follower")
+			rf.becomeFollower(reply.Term)
+			rf.electionStartTime = time.Now()
+		}
 	}
 }
 
