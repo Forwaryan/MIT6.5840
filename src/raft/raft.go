@@ -377,6 +377,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	//避免Leader每次日志不匹配只往前移动一次;若日志很长的话在一段时间内无法到达冲突位置
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -676,11 +679,31 @@ func (rf *Raft) handleAppendEntriesRPCResponse(server int, args *AppendEntriesAr
 					rf.commitCond.Signal()
 				}
 
-			} else if rf.nextIndex[server] > 1 {
+			} else {
+				rf.rflog("receives reply from[%v] failed", server)
+				if reply.ConflictTerm > 0 {
+					//对应PrevLogIndex < rf.getNextIndex - 跳到不冲突Term
+					lastIndex := -1
+					firstIndex := rf.getFirstIndex()
+					for i := args.PrevLogIndex - 1; i >= firstIndex; i-- {
+						if rf.getTerm(i) == reply.ConflictTerm {
+							lastIndex = i
+							break
+						} else if rf.getTerm(i) < reply.ConflictTerm {
+							break
+						}
+					}
+					//lastIndex是跳到与leader Prev 相等的Term的第一个
+					//reply.ConflictIndex是跳到和这个server term相等的最后一个
+					if lastIndex > 0 {
+						rf.nextIndex[server] = lastIndex + 1
+					} else {
+						rf.nextIndex[server] = max(reply.ConflictIndex, rf.matchIndex[server]+1)
+					}
 
-				rf.nextIndex[server] -= 1
-				rf.rflog("tttttttttttt receives reply from [%v] failed", server)
-				return true
+				} else {
+					rf.nextIndex[server] = max(reply.ConflictIndex, rf.matchIndex[server]+1)
+				}
 			}
 		} else if reply.Term > rf.currentTerm {
 			rf.rflog("receive bigger term in reply, transforms to follower")
@@ -763,6 +786,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.commitIndex = min(rf.getNextIndex()-1, args.LeaderCommit)
 				rf.rflog("updates commitIndex into %v", rf.commitIndex)
 				rf.commitCond.Signal()
+			}
+		} else {
+			if args.PrevLogIndex >= rf.getNextIndex() {
+				reply.ConflictIndex = rf.getNextIndex()
+				reply.ConflictTerm = -1
+			} else {
+				//PrevLogIndex < rf.getNextIndex
+				reply.ConflictTerm = rf.getTerm(args.PrevLogIndex)
+				var index int
+				//当前leader term != server term
+
+				for index = args.PrevLogIndex - 1; index >= rf.getFirstIndex(); index-- {
+					if rf.getTerm(index) != reply.ConflictTerm {
+						break
+					}
+				}
+				reply.ConflictIndex = index + 1
 			}
 		}
 	}
