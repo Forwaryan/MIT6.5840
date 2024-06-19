@@ -3,6 +3,7 @@ package kvsrv
 import (
 	"crypto/rand"
 	"math/big"
+	"sync/atomic"
 
 	"6.5840/labrpc"
 )
@@ -43,7 +44,9 @@ func (ck *Clerk) Get(key string) string {
 		Key: key,
 	}
 	reply := GetReply{}
-	ck.server.Call("KVServer.Get", &args, &reply)
+	for !ck.server.Call("KVServer.Get", &args, &reply) {
+
+	}
 	return reply.Value
 }
 
@@ -55,14 +58,26 @@ func (ck *Clerk) Get(key string) string {
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
+
+var id int64
+
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	// You will have to modify this function.
+
 	args := PutAppendArgs{
 		Key:   key,
 		Value: value,
+		Id:    atomic.AddInt64(&id, 1),
 	}
 	reply := PutAppendReply{}
-	ck.server.Call("KVServer."+op, &args, &reply)
+	for !ck.server.Call("KVServer."+op, &args, &reply) {
+
+	}
+	Finishreply := PutAppendReply{}
+	for !ck.server.Call("KVServer.Finish", &args, &Finishreply) {
+
+	}
+
 	return reply.Value
 }
 
