@@ -110,6 +110,8 @@ const (
 	Dead
 )
 
+// 涉及到快照 所以真实下标和在日志中的下标是不同的
+// 日志的第一项充当记录，保存LastIncludedIndex 和 LastIncludedTerm
 type LogEntry struct {
 	Command interface{}
 	Term    int
@@ -223,7 +225,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.log = append(tmp, rf.log[index-lastIndex:]...)
 	//第0个日志存快照信息
 	//lastIncludedIndex 和 lastIncludeTerm 就是下标为 index 的日志的信息
-	//, 因此裁剪时保留它充当快照信息
+	//因此裁剪时保留它充当快照信息
 	rf.log[0].Command = nil
 	rf.persister.Save(rf.encodeState(), snapshot)
 }
@@ -532,6 +534,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.state = Dead
+	rf.rflog("state dead")
+
 }
 
 func (rf *Raft) killed() bool {
@@ -586,7 +593,7 @@ func (rf *Raft) ticker(state RuleState) {
 // 注意，我们一定要保持任期是一致的，若落后了表明当前协程是上个任期运行的定时器，直接结束
 // 一直满足条件的话，就等待超时后变为候选者进行选举
 func (rf *Raft) runElectionTimer() {
-	ms := 150 + (rand.Int63() % 150)
+	ms := 250 + (rand.Int63() % 150)
 	timeout := time.Duration(ms) * time.Millisecond
 	rf.mu.Lock()
 	nowTerm := rf.currentTerm
@@ -839,6 +846,10 @@ func (rf *Raft) handleAppendEntriesRPCResponse(server int, args *AppendEntriesAr
 				} else {
 					rf.nextIndex[server] = max(reply.ConflictIndex, rf.matchIndex[server]+1)
 				}
+				//这里为什么要返回true?
+				//返回true的情况下为了让他重新发日志
+				rf.rflog("receives reply from [%v] failed, nextIndex changes to [%d]", server, rf.nextIndex[server])
+				return true
 			}
 		} else if reply.Term > rf.currentTerm {
 			rf.rflog("receive bigger term in reply, transforms to follower")
