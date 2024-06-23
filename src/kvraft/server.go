@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -45,7 +46,11 @@ type KVServer struct {
 	// Your definitions here.
 	KVDB           map[string]string // 状态机，记录(K,V)键值对
 	waitChMap      map[int]chan *Op  //通知chan，key为日志的下标，值为通道
-	lastRequestMap map[int64]int64   // 保存每个客户端对应的最近的一次请求ID
+	LastRequestMap map[int64]int64   // 保存每个客户端对应的最近的一次请求ID
+
+	//Lab4B
+	persister         *raft.Persister
+	lastIncludedIndex int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -150,7 +155,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 // 检查当前的命令是否有效，非Get命令需要检查 保持幂等性
 func (kv *KVServer) isInvalidRequest(ClientId int64, requestId int64) bool {
-	if lastRequestId, ok := kv.lastRequestMap[ClientId]; ok {
+	if lastRequestId, ok := kv.LastRequestMap[ClientId]; ok {
 		//请求以过期
 		if requestId <= lastRequestId {
 			return true
@@ -186,6 +191,17 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+// 需要持久化的字段为 数据库
+// 为了避免重复执行命令，每个客户端最近一次请求的 Id 也需要持久化处理
+func (kv *KVServer) encodeState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.KVDB)
+	e.Encode(kv.LastRequestMap)
+	kvstate := w.Bytes()
+	return kvstate
+}
+
 // 监听Raft提交的apllyMsg，根据其类别执行不同的操作
 // 为命令时必须执行，执行完后检查是否需要给waitChan发消息
 func (kv *KVServer) applier() {
@@ -196,6 +212,15 @@ func (kv *KVServer) applier() {
 		DPrintf("[%d] receives applyMsg [%v]", kv.me, applyMsg)
 		//根据接收到的是命令还是快照来决定相应的操作，3A只执行命令
 		if applyMsg.CommandValid {
+
+			//4B 需要判断日志是否被裁剪
+			if applyMsg.CommandIndex <= kv.lastIncludedIndex {
+				// 快照中已经包含了该命令
+				DPrintf("[%d] has snapshot this command!", kv.me)
+				kv.mu.Unlock()
+				continue
+			}
+
 			op := applyMsg.Command.(Op)
 			kv.execute(&op)
 			currentTermm, isLeader := kv.rf.GetState()
@@ -205,11 +230,48 @@ func (kv *KVServer) applier() {
 			if isLeader && applyMsg.CommandTerm == currentTermm {
 				kv.notifyWaitCh(applyMsg.CommandIndex, &op)
 			}
-		} else if applyMsg.SnapshotValid {
-			//
 
+			// 4B 命令执行完之后检查状态，如果有必要的话需要进行快照压缩Raft日志
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
+				DPrintf("[%d] has too big RaftStateSize, run Raft.Snapshot()", kv.me)
+				kv.rf.Snapshot(applyMsg.CommandIndex, kv.encodeState())
+			}
+			kv.lastIncludedIndex = applyMsg.CommandIndex
+
+		} else if applyMsg.SnapshotValid {
+			//Follower收到了快照，若是最新的快照，读取快照信息并更新自身状态
+			if applyMsg.SnapshotIndex <= kv.lastIncludedIndex {
+				// 过期快照
+				DPrintf("[%d] receive old snapshot, lastIncludeIndex [%d], applyMsg.SnapshotIndex [%d]",
+					kv.me, kv.lastIncludedIndex, applyMsg.SnapshotIndex)
+
+				kv.mu.Unlock()
+				continue
+			}
+			// 用快照更新自身
+			kv.readPersist(applyMsg.Snapshot)
+			kv.lastIncludedIndex = applyMsg.CommandIndex
 		}
 		kv.mu.Unlock()
+	}
+}
+
+// 读取持久化状态
+func (kv *KVServer) readPersist(data []byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	kvdb := map[string]string{}
+	lastRequestMap := map[int64]int64{}
+	if d.Decode(&kvdb) != nil || d.Decode(&lastRequestMap) != nil {
+		return
+	} else {
+		// kv.mu.Lock()
+		kv.KVDB = kvdb
+		kv.LastRequestMap = lastRequestMap
+		// kv.mu.Unlock()
 	}
 }
 
@@ -246,9 +308,9 @@ func (kv *KVServer) execute(op *Op) {
 
 // 更新对客户端对应的最近一次请求的Id，避免执行过期的RPC或者已经执行过的命令
 func (kv *KVServer) UpdateLastRequest(op *Op) {
-	lastRequestId, ok := kv.lastRequestMap[op.ClientId]
+	lastRequestId, ok := kv.LastRequestMap[op.ClientId]
 	if (ok && lastRequestId < op.RequestId) || !ok {
-		kv.lastRequestMap[op.ClientId] = op.RequestId
+		kv.LastRequestMap[op.ClientId] = op.RequestId
 	}
 }
 
@@ -282,7 +344,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.KVDB = make(map[string]string)
 	kv.waitChMap = make(map[int]chan *Op)
-	kv.lastRequestMap = make(map[int64]int64)
+	kv.LastRequestMap = make(map[int64]int64)
+
+	// 4B
+	kv.persister = persister
+	kv.readPersist(kv.persister.ReadSnapshot())
 
 	go kv.applier()
 	return kv
