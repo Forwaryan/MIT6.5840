@@ -65,6 +65,8 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	//Lab4A增加
+	CommandTerm int
 
 	// For 3D:
 	SnapshotValid bool
@@ -517,6 +519,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Index:   rf.getNextIndex(),
 	})
 	rf.persist()
+	// TestSpeed4A (100.45s)
+	//test_test.go:419: Operations completed too slowly 99.900015ms/op > 33.333333ms/op
+	//及时发送心跳，保证速度
+	rf.runHeartBeats()
 	// rf.rflog("start aaaaaa : %d", rf.getLastIndex())
 	return rf.getLastIndex(), rf.currentTerm, true
 	// return index, term, isLeader
@@ -1003,13 +1009,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker(Follower)
 
 	//检查是否需要提交命令
-	go rf.commitCommand()
+	go rf.apply()
 	return rf
 }
 
 // 提交命令给test程序
 // rf.lastApplied >= rf.commitIndex 时调用wait
-func (rf *Raft) commitCommand() {
+func (rf *Raft) apply() {
 	for !rf.killed() {
 		rf.mu.Lock()
 		for rf.lastApplied >= rf.commitIndex {
@@ -1031,6 +1037,8 @@ func (rf *Raft) commitCommand() {
 				CommandValid: true,
 				Command:      entry.Command,
 				CommandIndex: entry.Index,
+				//Lab4A增加
+				CommandTerm: entry.Term,
 			}
 		}
 		rf.rflog("commits log from over !!")
