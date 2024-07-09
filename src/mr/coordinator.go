@@ -63,6 +63,7 @@ func (m *Master) AllocateTask(args *WorkerArgs, reply *WorkerReply) error {
 			m.maptasklog[allocate] = 1 // waiting
 			m.mu.Unlock()              // avoid deadlock
 			go func() {
+				// 等待十秒钟检查是否完成，如果未完成则重新分配出去
 				time.Sleep(time.Duration(10) * time.Second) // wait 10 seconds
 				m.mu.Lock()
 				if m.maptasklog[allocate] == 1 {

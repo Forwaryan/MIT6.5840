@@ -77,12 +77,14 @@ func Worker(mapf func(string, string) []KeyValue,
 			for i := range buckets {
 				buckets[i] = []KeyValue{}
 			}
+			// 将任务均匀分到NRdecu个桶里，方便后续分发
 			for _, kva := range intermediate {
 				buckets[ihash(kva.Key)%reply.NReduce] = append(buckets[ihash(kva.Key)%reply.NReduce], kva)
 			}
 
 			// write into intermediate files
 			for i := range buckets {
+				//中间文件夹mr-X-Y  X是Map的编号 Y是对应Reduce的编号
 				oname := "mr-" + strconv.Itoa(reply.MapTaskNumber) + "-" + strconv.Itoa(i)
 				ofile, _ := ioutil.TempFile("", oname+"*")
 				enc := json.NewEncoder(ofile)
@@ -138,12 +140,14 @@ func Worker(mapf func(string, string) []KeyValue,
 					j++
 				}
 				values := []string{}
+				// 将Key相同的放在同一个values下，发送给reducef来组合
 				for k := i; k < j; k++ {
 					values = append(values, intermediate[k].Value)
 				}
 				output := reducef(intermediate[i].Key, values)
 
 				// this is the correct format for each line of Reduce output.
+				//将对应Keys整合后确定最终的Values 然后输出的文件
 				fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
 
 				i = j
@@ -151,6 +155,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			os.Rename(ofile.Name(), oname)
 			ofile.Close()
 
+			//删除中间文件
 			for i := 0; i < reply.NMap; i++ {
 				iname := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(reply.ReduceTaskNumber)
 				err := os.Remove(iname)
@@ -166,7 +171,6 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 		time.Sleep(time.Second)
 	}
-	return
 }
 
 // example function to show how to make an RPC call to the master.
