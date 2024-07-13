@@ -337,6 +337,30 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state == Dead {
+		//非leader直接return
+		return
+	}
+
+	rf.rflog("AppendEntries [%+v]", args)
+
+	if args.Term > rf.currentTerm {
+		rf.becomeFollower(args.Term)
+		rf.electionStartTime = time.Now()
+	}
+	reply.Success = false
+	if args.Term == rf.currentTerm {
+		rf.state = Follower
+		rf.electionStartTime = time.Now()
+		reply.Success = true
+	}
+
+	reply.Term = rf.currentTerm
+}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -420,12 +444,12 @@ func (rf *Raft) ticker(state RuleState) {
 	}
 }
 
-// 超时选举 [50, 300]
+// 超时选举 [250, 400]
 // 利用定时器不断检查，变为Leader后直接结束
 // 注意，我们一定要保持任期是一致的，若落后了表明当前协程是上个任期运行的定时器，直接结束
 // 一直满足条件的话，就等待超时后变为候选者进行选举
 func (rf *Raft) runElectionTimer() {
-	ms := 50 + (rand.Int63() % 300)
+	ms := 250 + (rand.Int63() % 150)
 	timeout := time.Duration(ms) * time.Millisecond
 	rf.mu.Lock()
 	nowTerm := rf.currentTerm
@@ -522,35 +546,35 @@ func (rf *Raft) runHeartBeats() {
 		return
 	}
 
-	// currentTerm := rf.currentTerm
-	// leaderid := rf.me
+	currentTerm := rf.currentTerm
+	leaderid := rf.me
 	rf.rflog("ticker!!!--------run runHeartBeats()")
 
-	// for server := range rf.peers {
-	// 	if server == rf.me {
-	// 		continue
-	// 	}
+	for server := range rf.peers {
+		if server == rf.me {
+			continue
+		}
 
-	// 	go func(server int) {
-	// 		args := AppendEntriesArgs{
-	// 			Term:     currentTerm,
-	// 			LeaderId: leaderid,
-	// 		}
+		go func(server int) {
+			args := AppendEntriesArgs{
+				Term:     currentTerm,
+				LeaderId: leaderid,
+			}
 
-	// 		var reply AppendEntriesReply
-	// 		rf.rflog("sending AppendEntries to [%v], args = [%+v]", server, args)
-	// 		if success := rf.sendHeartBeats(server, &args, &reply); success {
-	// 			rf.rflog("receive AppendEntries reply [%+v]", reply)
-	// 			rf.mu.Lock()
-	// 			defer rf.mu.Unlock()
-	// 			if reply.Term > currentTerm {
-	// 				rf.rflog(" receive bigger term in reply, transforms to follower")
-	// 				rf.becomeFollower(reply.Term)
-	// 				return
-	// 			}
-	// 		}
-	// 	}(server)
-	// }
+			var reply AppendEntriesReply
+			rf.rflog("sending AppendEntries to [%v], args = [%+v]", server, args)
+			if success := rf.sendHeartBeats(server, &args, &reply); success {
+				rf.rflog("receive AppendEntries reply [%+v]", reply)
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				if reply.Term > currentTerm {
+					rf.rflog(" receive bigger term in reply, transforms to follower")
+					rf.becomeFollower(reply.Term)
+					return
+				}
+			}
+		}(server)
+	}
 }
 
 func (rf *Raft) sendHeartBeats(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
