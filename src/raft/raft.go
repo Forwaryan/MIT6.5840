@@ -897,6 +897,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.electionStartTime = time.Now()
 
 		//远程调用的日志信息已经在当前raft实例中过时，因为在当前raft中不存在该索引的日志
+		//发送的日志比目前server的第一个日志还小，那么我们默认存储在了快照中
 		if args.PrevLogIndex < rf.getFirstIndex() {
 			rf.rflog("receives out of data AppendEntries RPC, args.PrevLogIndex [%d], LastIncludedIndex [%d]", args.PrevLogIndex, rf.getFirstIndex())
 			reply.Success = false
@@ -906,6 +907,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		// rf.rflog("tqtqtqtq %d", args.PrevLogIndex)
 
+		//Follower可能有一些日志需要进行覆盖 args.PrevLogIndex < rf.getNextIndex()的情况
 		if args.PrevLogIndex < rf.getNextIndex() && args.PrevLogTerm == rf.getTerm(args.PrevLogIndex) {
 			reply.Success = true
 			insertIndex := args.PrevLogIndex + 1
