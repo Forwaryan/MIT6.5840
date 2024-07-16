@@ -264,6 +264,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	reply.Term = rf.currentTerm
+
 	if args.Term == rf.currentTerm {
 		if rf.state != Follower {
 			rf.state = Follower
@@ -271,21 +272,25 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.electionStartTime = time.Now()
 
 		//因为延迟得到过期的快照
+		//已经提交的日志就没有必要在用快照复制到server上了
 		if rf.commitIndex >= args.LastIncludedIndex {
 			rf.rflog("receive out of data snapshot, commitIndex: [%d], args.LsdtIncludedIndex: [%d]", rf.commitIndex, args.LastIncludedIndex)
 			rf.mu.Unlock()
 			return
 		}
-
-		//裁剪日志，将已经保存到快照的日志删除
+		//根据快照中最后一个日志的下标所有 与当前server的最后一个日志索引比较大小
+		//决定接下来对server日志的处理
 		if rf.getLastIndex() <= args.LastIncludedIndex {
-			//将以保存到快照中的日志删除
+			//自己的日志已经很旧且被提交了，只需要直接换为快照即可
 			rf.log = make([]LogEntry, 1)
 		} else {
+			//当前server的最后一个日志索引大于快照的最后一个索引，那么当前server包含一部分快照中没有的日志
 			var tmp []LogEntry
+			//删掉server中快照已有的，只保存还没存到快照中的日志
 			rf.log = append(tmp, rf.log[args.LastIncludedIndex-rf.getFirstIndex():]...)
 		}
 
+		//每个server的log[0]都存储最新快照的最后一个日志的所有和热任期
 		rf.log[0].Term = args.LastIncludedTerm
 		rf.log[0].Index = args.LastIncludedIndex
 		rf.log[0].Command = nil
@@ -518,6 +523,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 		Index:   rf.getNextIndex(),
 	})
+
+	//log[]持久化变量修改，这里需要persist下
 	rf.persist()
 	// TestSpeed4A (100.45s)
 	//test_test.go:419: Operations completed too slowly 99.900015ms/op > 33.333333ms/op
@@ -676,8 +683,9 @@ func (rf *Raft) startElection() {
 						receivedVotes += 1
 						if receivedVotes*2 >= len(rf.peers)+1 {
 							rf.rflog("id : [%d] wins the selection, becomes leader!", rf.me)
+							//该server变为leader
 							rf.becomeLeader()
-							rf.runHeartBeats()
+							// rf.runHeartBeats()
 						}
 					} else if reply.Term > rf.currentTerm {
 						rf.rflog("receive bigger term in reply, maybe out of data")
@@ -690,7 +698,8 @@ func (rf *Raft) startElection() {
 		}(server)
 	}
 
-	// 参考代码：因为锁的抢占问题可能 ticker() 中获取状态时已经变成 leader 了，进而存在两个心跳计时器，因此指定开启哪个定时器
+	//此次选举是可能是失败的，而一个节点进来后currentTerm会增长，那么直接的ticker会因为当前任期匹配不上而return掉
+	//我们还需要继续开启新的选举定时器来避免此次选举失败
 	go rf.ticker(Follower)
 }
 
@@ -721,11 +730,13 @@ func (rf *Raft) runHeartBeats() {
 
 				firstIndex := rf.getFirstIndex()
 				//想要发送的日志已经被删除了，需要快照来恢复
+				//上一个快照的末尾日志会保存在log[0]
 				if rf.nextIndex[server] <= firstIndex {
 					rf.rflog("send snapshot to %d, nextIndex is [%d] but lastIncludedIndex is [%d]", server, rf.nextIndex[server], firstIndex)
 					args := InstallSnapshotArgs{
-						Term:              currentTerm,
-						LeaderId:          rf.me,
+						Term:     currentTerm,
+						LeaderId: rf.me,
+						//快照的最后一个日志的任期，实际上也是目前Leader下标为0的日志的任期
 						LastIncludedTerm:  rf.getFirstTerm(),
 						LastIncludedIndex: firstIndex,
 						Snapshot:          rf.persister.ReadSnapshot(),
@@ -1034,6 +1045,7 @@ func (rf *Raft) apply() {
 		rf.mu.Unlock()
 		rf.rflog("commit log: [%v]", logEntries)
 
+		//遍历已经commit的命令，提交到状态机
 		for _, entry := range logEntries {
 			rf.applyChan <- ApplyMsg{
 				CommandValid: true,
