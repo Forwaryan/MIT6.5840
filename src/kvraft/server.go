@@ -62,6 +62,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		Key:       args.Key,
 	}
 	//该命令提交时的索引  当前的任期
+	//该命令提交后需要等到commit才能在通道waitChan中检索到
 	index, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -70,6 +71,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	id := kv.me
 	DPrintf("[%d] send Get to leader, log index [%d], log term [%d], args [%v]", id, index, term, args)
+	//命令Op会通过 Chan *Op 来传递 - waitChan
 	waitChan, exist := kv.waitChMap[index]
 	if !exist {
 		kv.waitChMap[index] = make(chan *Op, 1)
@@ -77,6 +79,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	DPrintf("[%d] wait for timeout", id)
 	kv.mu.Unlock()
+
 	select {
 	case res := <-waitChan:
 		DPrintf("[%d] receive res from waitChan [%v]", id, res)
@@ -92,6 +95,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 	}
 	kv.mu.Lock()
+	//注意每次用完后都要删除，防止爆内存
 	delete(kv.waitChMap, index)
 	kv.mu.Unlock()
 }
@@ -221,6 +225,7 @@ func (kv *KVServer) applier() {
 				continue
 			}
 
+			//将applyMsg转换为Op类型
 			op := applyMsg.Command.(Op)
 			kv.execute(&op)
 			currentTermm, isLeader := kv.rf.GetState()
